@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+financials.json
+financials-cache.json
+third_party_scores.json
+watchlist-state.json
+state-check.csv
+data/daily/
+fall-check-LuxAlgo-daily-final-backup.py
