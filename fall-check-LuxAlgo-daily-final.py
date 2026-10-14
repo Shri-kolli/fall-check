@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daily NIFTY 250 long-term watchlist scanner.
+"""Daily NIFTY 250 current-state LuxAlgo SMC scanner.
 
 This is an idea generator, not a trading system. It never places orders.
 LuxAlgo attribution: Smart Money Concepts by LuxAlgo, licensed under
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import json
 import logging
 import math
@@ -34,12 +35,12 @@ STATE_FILE = os.getenv("STATE_FILE", "watchlist-state.json")
 
 SWING_LENGTH = 50
 SMC_LOOKBACK_DAYS = 1300
-STRONG_LOW_ENTRY_DISTANCE = 10.0
+STRONG_LOW_ENTRY_DISTANCE = 7.0
 WEAK_HIGH_ENTRY_DISTANCE = 5.0
 MAX_LEVEL_BREAK_DISTANCE = 0.0
 MAX_EQUILIBRIUM_DISTANCE = 15.0
-WATCHLIST_RETENTION_DAYS = 30
 SCREENER_CACHE_TTL_DAYS = 7
+SCANNER_VERSION = "luxalgo-daily-v1"
 MIN_FINANCIAL_SCORE = 65.0
 FINANCIAL_LOOKBACK_YEARS = 5
 MIN_REVENUE_CAGR_5Y = 30.0
@@ -147,6 +148,8 @@ class FinancialMetrics:
     operating_cash_flow: tuple[float, ...] = ()
     debt: tuple[float, ...] = ()
     interest_coverage: tuple[float, ...] = ()
+    current_pe: float | None = None
+    sector_pe: float | None = None
 
 
 @dataclass(frozen=True)
@@ -176,13 +179,21 @@ class WatchlistEntry:
     distance_percent: float
     financial_score: float
     financial_grade: str
-    trendlyne_durability: float | None
-    stockedge_score: float | None
-    equilibrium_distance: float
-    created_at: str
-    expires_at: str
+    financial_status: str = "INCOMPLETE"
+    current_pe: float | None = None
+    sector_pe: float | None = None
+    historical_pe: float | None = None
+    pe_status: str = "FAIL"
+    trendlyne_durability: float | None = None
+    stockedge_score: float | None = None
+    equilibrium_distance: float = 0.0
+    created_at: str = ""
+    expires_at: str = ""
     status: str = "WATCHING"
     cycle: int = 1
+    scanner_run_at: str = ""
+    scanner_version: str = SCANNER_VERSION
+    daily_data_as_of: str = ""
 
 
 @dataclass(frozen=True)
@@ -251,6 +262,8 @@ class JsonFinancialDataProvider:
             operating_cash_flow=_tuple_numbers(item.get("operating_cash_flow")),
             debt=_tuple_numbers(item.get("debt")),
             interest_coverage=_tuple_numbers(item.get("interest_coverage")),
+            current_pe=(float(item["current_pe"]) if _finite(item.get("current_pe")) else None),
+            sector_pe=(float(item["sector_pe"]) if _finite(item.get("sector_pe")) else None),
         )
 
 
@@ -263,6 +276,7 @@ class ScreenerFinancialDataProvider:
         self.base_url = base_url or os.getenv("SCREENER_BASE_URL", "https://www.screener.in/company/{symbol}/consolidated/")
         self.cache_ttl_days = cache_ttl_days
         self._cache: dict[str, Mapping[str, Any]] = {}
+        self._moneycontrol_sector_pe_cache: dict[str, float | None] = {}
         self._load_cache()
 
     def _load_cache(self) -> None:
@@ -448,6 +462,182 @@ class ScreenerFinancialDataProvider:
             interest_coverage=metrics["interest_coverage"],
         )
 
+    @staticmethod
+    def _parse_valuation(raw_html: str) -> tuple[float | None, float | None]:
+        """Extract current P/E from Screener and sector P/E from Moneycontrol."""
+        try:
+            from bs4 import BeautifulSoup  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("Install beautifulsoup4 to use the Screener provider") from exc
+
+        soup = BeautifulSoup(raw_html, "html.parser")
+        text = soup.get_text(" ", strip=True)
+
+        def regex_value(patterns: Sequence[str]) -> float | None:
+            for pattern in patterns:
+                match = re.search(pattern, text, flags=re.IGNORECASE)
+                if match:
+                    return ScreenerFinancialDataProvider._parse_number(match.group(1))
+            return None
+
+        current_pe = regex_value([
+            r"Stock P/E\s+([0-9.,\-]+)",
+            r"Stock P/E\s*([0-9.,\-]+)",
+        ])
+        return current_pe, None
+
+    def _fetch_moneycontrol_sector_pe(self, stock: Stock) -> float | None:
+        """Resolve the Moneycontrol stock page and fetch its published Sector PE."""
+        cache_key = stock.symbol.upper()
+        if cache_key in self._moneycontrol_sector_pe_cache:
+            return self._moneycontrol_sector_pe_cache[cache_key]
+
+        try:
+            import json
+            import requests  # type: ignore
+            from bs4 import BeautifulSoup  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("Install requests and beautifulsoup4 for Moneycontrol sector PE") from exc
+
+        session = requests.Session()
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            )
+        }
+        base = "https://www.moneycontrol.com"
+        search_url = f"{base}/mccode/common/autosuggestion_solr.php"
+
+        try:
+            suggestions: list[Mapping[str, Any]] = []
+            for query in (stock.symbol, stock.name):
+                response = session.get(
+                    search_url,
+                    params={
+                        "classic": "true",
+                        "query": query,
+                        "type": "1",
+                        "format": "json",
+                        "callback": "suggest1",
+                    },
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                payload = response.text.strip()
+
+                if payload.startswith("suggest1(") and payload.endswith(")"):
+                    payload = payload[len("suggest1("):-1]
+
+                decoded = json.loads(payload)
+                if isinstance(decoded, list):
+                    suggestions = [
+                        item for item in decoded
+                        if isinstance(item, Mapping)
+                    ]
+                if suggestions:
+                    break
+
+            wanted_symbol = stock.symbol.strip().upper()
+            wanted_name = re.sub(r"[^a-z0-9]+", " ", stock.name.lower()).strip()
+
+            selected: Mapping[str, Any] | None = None
+
+            # Prefer an exact trading-symbol match.
+            for item in suggestions:
+                symbol = str(
+                    item.get("symbol")
+                    or item.get("nse_symbol")
+                    or item.get("trading_symbol")
+                    or ""
+                ).strip().upper()
+                if symbol == wanted_symbol:
+                    selected = item
+                    break
+
+            # Fall back to an exact company-name match.
+            if selected is None:
+                for item in suggestions:
+                    name = re.sub(
+                        r"[^a-z0-9]+",
+                        " ",
+                        str(item.get("name") or item.get("company_name") or "").lower(),
+                    ).strip()
+                    if name and name == wanted_name:
+                        selected = item
+                        break
+
+            # Last resort: use the first Moneycontrol suggestion.
+            if selected is None and suggestions:
+                selected = suggestions[0]
+
+            stock_url = None if selected is None else (
+                selected.get("link_src")
+                or selected.get("link")
+                or selected.get("url")
+                or selected.get("company_url")
+            )
+            if not stock_url:
+                LOG.warning(
+                    "Moneycontrol search found no stock page for %s",
+                    stock.symbol,
+                )
+                self._moneycontrol_sector_pe_cache[cache_key] = None
+                return None
+
+            stock_url = str(stock_url)
+            if stock_url.startswith("/"):
+                stock_url = base + stock_url
+
+            stock_page = session.get(
+                stock_url,
+                headers=headers,
+                timeout=self.timeout,
+            )
+            stock_page.raise_for_status()
+
+            stock_text = BeautifulSoup(
+                stock_page.text,
+                "html.parser",
+            ).get_text(" ", strip=True)
+
+            match = re.search(
+                r"Sector\s*PE\s*(?:\||:)?\s*([0-9.,]+)",
+                stock_text,
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                LOG.warning(
+                    "Moneycontrol stock page has no Sector PE for %s: %s",
+                    stock.symbol,
+                    stock_url,
+                )
+                self._moneycontrol_sector_pe_cache[cache_key] = None
+                return None
+
+            value = self._parse_number(match.group(1))
+            self._moneycontrol_sector_pe_cache[cache_key] = value
+
+            if value is not None:
+                LOG.info(
+                    "Moneycontrol Sector PE: %s = %.2f",
+                    stock.symbol,
+                    value,
+                )
+
+            return value
+
+        except Exception as exc:
+            LOG.warning(
+                "Moneycontrol Sector PE lookup failed for %s: %s",
+                stock.symbol,
+                exc,
+            )
+            self._moneycontrol_sector_pe_cache[cache_key] = None
+            return None
+
     def _fetch_html(self, stock: Stock) -> str:
         try:
             import requests  # type: ignore
@@ -481,10 +671,16 @@ class ScreenerFinancialDataProvider:
                 operating_cash_flow=_tuple_numbers(cached.get("metrics", {}).get("operating_cash_flow")),
                 debt=_tuple_numbers(cached.get("metrics", {}).get("debt")),
                 interest_coverage=_tuple_numbers(cached.get("metrics", {}).get("interest_coverage")),
+                current_pe=(float(cached.get("current_pe")) if _finite(cached.get("current_pe")) else None),
+                sector_pe=(float(cached.get("sector_pe")) if _finite(cached.get("sector_pe")) else None),
             )
+
         stale = cached if cached is not None else None
         try:
-            parsed = self._parse_html_metrics(self._fetch_html(stock))
+            raw_html = self._fetch_html(stock)
+            parsed = self._parse_html_metrics(raw_html)
+            current_pe, sector_pe = self._parse_valuation(raw_html)
+            sector_pe = self._fetch_moneycontrol_sector_pe(stock)
         except Exception as exc:
             LOG.warning("Screener lookup failed for %s: %s", stock.symbol, exc)
             if stale is not None:
@@ -499,8 +695,11 @@ class ScreenerFinancialDataProvider:
                     operating_cash_flow=_tuple_numbers(stale.get("metrics", {}).get("operating_cash_flow")),
                     debt=_tuple_numbers(stale.get("metrics", {}).get("debt")),
                     interest_coverage=_tuple_numbers(stale.get("metrics", {}).get("interest_coverage")),
+                    current_pe=(float(stale.get("current_pe")) if _finite(stale.get("current_pe")) else None),
+                    sector_pe=(float(stale.get("sector_pe")) if _finite(stale.get("sector_pe")) else None),
                 )
             return None
+
         if parsed is None:
             if stale is not None:
                 LOG.warning("Using stale Screener cache for %s after parse failure", stock.symbol)
@@ -514,8 +713,11 @@ class ScreenerFinancialDataProvider:
                     operating_cash_flow=_tuple_numbers(stale.get("metrics", {}).get("operating_cash_flow")),
                     debt=_tuple_numbers(stale.get("metrics", {}).get("debt")),
                     interest_coverage=_tuple_numbers(stale.get("metrics", {}).get("interest_coverage")),
+                    current_pe=(float(stale.get("current_pe")) if _finite(stale.get("current_pe")) else None),
+                    sector_pe=(float(stale.get("sector_pe")) if _finite(stale.get("sector_pe")) else None),
                 )
             return None
+
         payload = {
             "fetched_at": datetime.utcnow().isoformat(),
             "metrics": {
@@ -529,10 +731,24 @@ class ScreenerFinancialDataProvider:
                 "debt": list(parsed.debt),
                 "interest_coverage": list(parsed.interest_coverage),
             },
+            "current_pe": current_pe,
+            "sector_pe": sector_pe,
         }
         self._cache[stock.symbol] = payload
         self._save_cache()
-        return parsed
+        return FinancialMetrics(
+            revenue=parsed.revenue,
+            pat=parsed.pat,
+            eps=parsed.eps,
+            roe=parsed.roe,
+            roce=parsed.roce,
+            operating_margin=parsed.operating_margin,
+            operating_cash_flow=parsed.operating_cash_flow,
+            debt=parsed.debt,
+            interest_coverage=parsed.interest_coverage,
+            current_pe=current_pe,
+            sector_pe=sector_pe,
+        )
 
 
 ScreenerFinancialProvider = ScreenerFinancialDataProvider
@@ -946,6 +1162,10 @@ def evaluate_signal(data: DailyMarketData, structure: SMCStructure, financial: F
 
     signal, level, distance = min(candidates, key=lambda item: item[2])
     created = as_of or date.today()
+    # Keep the daily candle completion rule strict: the scanner must never use
+    # a partial in-flight bar as the authoritative as-of date for the persisted
+    # current state.
+    daily_data_as_of = created.isoformat()
     equilibrium_distance = structure.equilibrium_distance if structure.equilibrium_distance is not None else 0.0
     return WatchlistEntry(
         symbol=data.stock.symbol,
@@ -954,13 +1174,21 @@ def evaluate_signal(data: DailyMarketData, structure: SMCStructure, financial: F
         price=price,
         level=level,
         distance_percent=round(distance, 2),
-        financial_score=0.0,
-        financial_grade="N/A",
+        financial_score=round(financial.score, 2),
+        financial_grade=financial.grade,
+        financial_status=financial.status,
+        current_pe=None,
+        sector_pe=None,
+        historical_pe=None,
+        pe_status="FAIL",
         trendlyne_durability=third_party.trendlyne_durability,
         stockedge_score=third_party.stockedge_fundamental,
         equilibrium_distance=equilibrium_distance,
         created_at=created.isoformat(),
-        expires_at=(created + timedelta(days=WATCHLIST_RETENTION_DAYS)).isoformat(),
+        expires_at="",
+        scanner_run_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        scanner_version=SCANNER_VERSION,
+        daily_data_as_of=daily_data_as_of,
     )
 
 
@@ -1041,11 +1269,19 @@ class WatchlistStore:
             "distance_percent",
             "financial_score",
             "financial_grade",
+            "financial_status",
+            "current_pe",
+            "sector_pe",
+            "historical_pe",
+            "pe_status",
             "trendlyne_durability",
             "stockedge_score",
             "equilibrium_distance",
             "created_at",
             "expires_at",
+            "scanner_run_at",
+            "scanner_version",
+            "daily_data_as_of",
         }
 
         entries: dict[str, WatchlistEntry] = {}
@@ -1090,9 +1326,13 @@ class WatchlistStore:
             os.fsync(handle.fileno())
         os.replace(temporary, self.path)
 
+    def save_current(self, entries: Sequence[WatchlistEntry]) -> None:
+        """Persist only the current day's scanner candidates; no retention."""
+        self.save({entry.symbol: entry for entry in entries})
+
     def active(self, today: date | None = None) -> dict[str, WatchlistEntry]:
-        today = today or date.today()
-        return {symbol: entry for symbol, entry in self.load().items() if date.fromisoformat(entry.expires_at) >= today}
+        """Compatibility helper: scanner state is current-only, so return all stored entries."""
+        return self.load()
 
     def merge(self, candidate: WatchlistEntry, today: date | None = None) -> tuple[WatchlistEntry, str]:
         entries = self.load()
@@ -1142,11 +1382,19 @@ class S3WatchlistStore(WatchlistStore):
             "distance_percent",
             "financial_score",
             "financial_grade",
+            "financial_status",
+            "current_pe",
+            "sector_pe",
+            "historical_pe",
+            "pe_status",
             "trendlyne_durability",
             "stockedge_score",
             "equilibrium_distance",
             "created_at",
             "expires_at",
+            "scanner_run_at",
+            "scanner_version",
+            "daily_data_as_of",
         }
 
         entries: dict[str, WatchlistEntry] = {}
@@ -1243,11 +1491,10 @@ def send_telegram(message: str) -> None:
 
 
 def format_report(
-    new_entries: Sequence[WatchlistEntry],
-    active: Sequence[WatchlistEntry],
-    expired: Sequence[WatchlistEntry] = (),
+    current_entries: Sequence[WatchlistEntry],
     scan_rows: Sequence[str] = (),
 ) -> str:
+    """Build the current daily scanner report only. No historical retention."""
     lines = [
         "DAILY NIFTY 250 — LUXALGO SMC SWING SCAN",
         f"Swing length={SWING_LENGTH} | Daily candles | Completed candles only",
@@ -1257,29 +1504,14 @@ def format_report(
         "| Stock | Price | Trend | Strong High | Weak High | Strong Low | Weak Low | Equilibrium | EqRange% | PriceEq% | Last BOS/CHoCH | Level Dist% | Verdict |",
     ]
     lines.extend(scan_rows or ["None"])
-
-    lines.extend(["", "CURRENT WATCHES CREATED/RENEWED THIS RUN"])
-    if new_entries:
-        for entry in new_entries:
+    lines.extend(["", f"CURRENT LUXALGO WATCH CANDIDATES: {len(current_entries)}"])
+    if current_entries:
+        for entry in sorted(current_entries, key=lambda item: (item.signal, item.distance_percent, item.symbol)):
             level_name = "Strong Low" if entry.signal == "LONG WATCH" else "Weak High"
             lines.append(
                 f"{entry.symbol} | {entry.signal} | Price {entry.price:.2f} | {level_name} {entry.level:.2f} | Dist {entry.distance_percent:.2f}%"
             )
     else:
-        lines.append("None")
-
-    lines.extend(["", "PERSISTED ACTIVE WATCHLIST (historical state)"])
-    if active:
-        for entry in sorted(active, key=lambda item: (item.signal, item.distance_percent, -item.financial_score)):
-            lines.append(
-                f"{entry.symbol} | {entry.signal} | Current {entry.price:.2f} | Level {entry.level:.2f} | Dist {entry.distance_percent:.2f}% | Added {entry.created_at} | Expires {entry.expires_at}"
-            )
-    else:
-        lines.append("None")
-
-    lines.extend(["", "EXPIRED WATCHES"])
-    lines.extend(f"{entry.symbol} | cycle {entry.cycle} | expired {entry.expires_at}" for entry in expired)
-    if not expired:
         lines.append("None")
     return "\n".join(lines)
 
@@ -1310,7 +1542,11 @@ def format_final_financial_report(entries: Sequence[WatchlistEntry], financials:
             f"Level: {entry.level:.2f}",
             f"Level distance: {entry.distance_percent:.2f}%",
             f"Equilibrium range: {entry.equilibrium_distance:.2f}%",
-            f"Financial score: {score.score:.2f} | Grade: {score.grade} | Status: {score.status}",
+            f"Financial score: {entry.financial_score:.2f} | Grade: {entry.financial_grade} | Status: {entry.financial_status}",
+            f"PE: {entry.current_pe:.2f}" if entry.current_pe is not None else "PE: N/A",
+            f"Sector PE: {entry.sector_pe:.2f}" if entry.sector_pe is not None else "Sector PE: N/A",
+            f"Historical PE ({FINANCIAL_LOOKBACK_YEARS}Y): {entry.historical_pe:.2f}" if entry.historical_pe is not None else f"Historical PE ({FINANCIAL_LOOKBACK_YEARS}Y): N/A",
+            f"PE status: {entry.pe_status}",
         ])
 
         if metrics is None:
@@ -1342,6 +1578,8 @@ def write_state_check_csv(entries: Sequence[WatchlistEntry], financials: Financi
     fieldnames = [
         "date", "symbol", "name", "signal", "price", "level", "level_distance_pct",
         "equilibrium_range_pct", "financial_score", "financial_grade", "financial_status",
+        "current_pe", "sector_pe", "historical_pe", "pe_status",
+        "scanner_run_at", "scanner_version", "daily_data_as_of",
         "revenue", "pat", "eps", "roe", "roce", "operating_margin",
         "operating_cash_flow", "debt", "interest_coverage",
         "revenue_cagr_5y", "pat_cagr_5y", "eps_cagr_5y",
@@ -1364,9 +1602,16 @@ def write_state_check_csv(entries: Sequence[WatchlistEntry], financials: Financi
             "level": f"{entry.level:.2f}",
             "level_distance_pct": f"{entry.distance_percent:.2f}",
             "equilibrium_range_pct": f"{entry.equilibrium_distance:.2f}",
-            "financial_score": f"{score.score:.2f}",
-            "financial_grade": score.grade,
-            "financial_status": score.status,
+            "financial_score": f"{entry.financial_score:.2f}",
+            "financial_grade": entry.financial_grade,
+            "financial_status": entry.financial_status,
+            "current_pe": f"{entry.current_pe:.2f}" if entry.current_pe is not None else "",
+            "sector_pe": f"{entry.sector_pe:.2f}" if entry.sector_pe is not None else "",
+            "historical_pe": f"{entry.historical_pe:.2f}" if entry.historical_pe is not None else "",
+            "pe_status": entry.pe_status,
+            "scanner_run_at": entry.scanner_run_at,
+            "scanner_version": entry.scanner_version,
+            "daily_data_as_of": entry.daily_data_as_of,
             "revenue": latest(metrics.revenue) if metrics else "",
             "pat": latest(metrics.pat) if metrics else "",
             "eps": latest(metrics.eps) if metrics else "",
@@ -1470,13 +1715,20 @@ def refresh_daily_market_cache(universe: Sequence[Stock], market: MarketDataProv
     return loaded, len(failed), failed
 
 
-def run_scan(universe: Sequence[Stock], market: MarketDataProvider, financials: FinancialDataProvider, scores: ThirdPartyScoreProvider, store: WatchlistStore) -> tuple[str, list[WatchlistEntry]]:
-    new_entries: list[WatchlistEntry] = []
-    final_entries: list[WatchlistEntry] = []
+def run_scan(
+    universe: Sequence[Stock],
+    market: MarketDataProvider,
+    financials: FinancialDataProvider,
+    scores: ThirdPartyScoreProvider,
+    store: WatchlistStore,
+) -> tuple[str, list[WatchlistEntry]]:
+    """Run one daily scan and persist only today's current candidates.
+
+    The scanner has no 30-day retention. Historical setup tracking belongs to
+    picker.py, which will consume this current S3 state.
+    """
+    current_entries: list[WatchlistEntry] = []
     scan_rows: list[str] = []
-    today = date.today()
-    previous = store.load()
-    expired_entries = [entry for entry in previous.values() if date.fromisoformat(entry.expires_at) < today]
 
     for stock in universe:
         cached = load_daily_market_data(stock.symbol)
@@ -1505,19 +1757,60 @@ def run_scan(universe: Sequence[Stock], market: MarketDataProvider, financials: 
                 f"{event} {event_date} | {level_text}% {level_name} | {verdict} |"
             )
 
-            # Watchlist persistence is based only on the current LuxAlgo-level verdict.
             neutral_financial = FinancialScore(0.0, "N/A", "DISABLED", None, None, None)
             candidate = evaluate_signal(cached, structure, neutral_financial, ThirdPartyScores())
             if candidate:
-                final_entries.append(candidate)
-                entry, status = store.merge(candidate)
-                if status in {"NEW", "RENEWED"}:
-                    new_entries.append(entry)
+                current_entries.append(candidate)
         except (OSError, ValueError, RuntimeError, KeyError) as exc:
             LOG.warning("%s skipped: %s", stock.symbol, exc)
             scan_rows.append(f"| {stock.symbol} | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | ERROR: {exc} | N/A | SKIPPED |")
 
-    return format_report(new_entries, list(store.active(today).values()), expired_entries, scan_rows), final_entries
+    # Refresh final shortlist fundamentals + valuation before persisting the
+    # canonical scanner state. The picker consumes this persisted contract only.
+    enriched_entries: list[WatchlistEntry] = []
+    scanner_run_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    daily_data_as_of = date.today().isoformat()
+
+    for entry in current_entries:
+        metrics = financials.metrics(Stock(entry.symbol, entry.name), force_refresh=True)
+        score = score_financials(metrics)
+
+        current_pe = metrics.current_pe if metrics else None
+        sector_pe = metrics.sector_pe if metrics else None
+        historical_pe = None
+        if metrics and len(metrics.eps) >= FINANCIAL_LOOKBACK_YEARS:
+            annual_eps = metrics.eps[-FINANCIAL_LOOKBACK_YEARS:]
+            if all(value > 0 for value in annual_eps):
+                average_eps = sum(annual_eps) / FINANCIAL_LOOKBACK_YEARS
+                if average_eps > 0 and entry.price > 0:
+                    historical_pe = entry.price / average_eps
+
+        pe_pass = (
+            current_pe is not None
+            and sector_pe is not None
+            and current_pe > 0
+            and sector_pe > 0
+            and current_pe < sector_pe * 1.50
+        )
+
+        enriched = dataclasses.replace(
+            entry,
+            financial_score=round(score.score, 2),
+            financial_grade=score.grade,
+            financial_status=score.status,
+            current_pe=current_pe,
+            sector_pe=sector_pe,
+            historical_pe=historical_pe,
+            pe_status="PASS" if pe_pass else "FAIL",
+            scanner_run_at=scanner_run_at,
+            scanner_version=SCANNER_VERSION,
+            daily_data_as_of=daily_data_as_of,
+        )
+        enriched_entries.append(enriched)
+
+    store.save_current(enriched_entries)
+
+    return format_report(enriched_entries, scan_rows), enriched_entries
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1554,26 +1847,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 store = S3WatchlistStore()
                 state_backend = "s3"
             except (OSError, ValueError, RuntimeError, json.JSONDecodeError):
-                LOG.warning("S3 state unavailable; falling back to local watchlist state")
+                LOG.warning("S3 state unavailable; falling back to local scanner state")
                 store = WatchlistStore(args.state)
         elif args.state_backend == "s3":
             store = S3WatchlistStore()
         else:
             store = WatchlistStore(args.state)
 
-        if args.financial_provider == "auto":
-            # Finalist financials are refreshed from Screener after the LuxAlgo scan.
-            # Keep the existing JSON provider option for explicit --financial-provider json.
-            financial_provider = "screener"
-            try:
-                if financial_provider == "screener":
-                    financials = ScreenerFinancialDataProvider()
-                else:
-                    financials = JsonFinancialDataProvider(args.financials)
-            except (OSError, ValueError, RuntimeError, json.JSONDecodeError):
-                LOG.warning("Primary financial provider failed; falling back to local JSON file")
-                financials = JsonFinancialDataProvider(args.financials)
-        elif args.financial_provider == "screener":
+        if args.financial_provider in ("auto", "screener"):
             financials = ScreenerFinancialDataProvider()
         else:
             financials = JsonFinancialDataProvider(args.financials)
@@ -1595,24 +1876,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             store,
         )
 
-        # IMPORTANT: LuxAlgo completes the shortlist first.
-        # Only stocks in that final shortlist receive a fresh Screener financial fetch.
-        final_financials = financials
-        if args.financial_provider != "json":
-            final_financials = ScreenerFinancialDataProvider()
-        else:
-            # Even when JSON is selected for compatibility, the production shortlist
-            # is refreshed from Screener so the final list receives latest data.
-            final_financials = ScreenerFinancialDataProvider()
-        final_financial_report = format_final_financial_report(final_entries, final_financials)
-        write_state_check_csv(final_entries, final_financials)
+        final_financial_report = format_final_financial_report(final_entries, financials)
+        write_state_check_csv(final_entries, financials)
         LOG.info(
             "Final LuxAlgo shortlist complete: %d stock(s). Latest financial data refreshed for shortlist.",
             len(final_entries),
         )
 
         if args.notify_telegram:
-            send_telegram(final_financial_report)
+            LOG.info("Scanner Telegram notification disabled; picker.py will own Telegram alerts.")
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         LOG.error("Scanner failed: %s", exc)
         return 1
