@@ -33,6 +33,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # =============================================================================
 # CONFIG — change values here
@@ -214,11 +215,10 @@ def iso(dt: datetime) -> str:
 
 
 def parse_dt(value: str) -> datetime:
-    value = value.replace("Z", "+00:00") if isinstance(value, str) else value
-    dt = datetime.fromisoformat(value)
-    if dt.tzinfo is not None:
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
-    return dt
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def normalize_dt(value: Any) -> datetime | None:
@@ -442,7 +442,7 @@ class KiteClient:
         if token is None:
             raise ValueError(f"No NSE instrument token for {symbol}")
 
-        end = datetime.now()
+        end = datetime.now(ZoneInfo("Asia/Kolkata"))
         start = end - timedelta(days=HOURLY_LOOKBACK_DAYS)
 
         last_error: Exception | None = None
